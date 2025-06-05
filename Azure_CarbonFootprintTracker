@@ -1,0 +1,94 @@
+import time
+from azureml.core import Run
+from azureml.core.compute import ComputeTarget
+from azureml.core.workspace import Workspace
+
+class CarbonFootprintTracker:
+    """
+    Wraps an Azure ML Run to convert elapsed training time → estimated CO₂ emissions (kg),
+    based on:
+      • A fixed power draw (watts) of your compute (CPU or GPU VM)
+      • An emission factor (kg CO₂ per kWh) for the Azure region
+    """
+    # Basic emission factors (kg CO₂e /kWh) for common Azure regions (2024 data).
+    # You can expand or update this mapping as needed.
+    REGION_EMISSION_FACTORS = {
+        "eastus": 0.429,       # example: U.S. East (Virginia)
+        "westus": 0.283,       # example: U.S. West (California)
+        "westeurope": 0.213,   # example: West Europe (Netherlands)
+        "southeastasia": 0.678,# example: Southeast Asia (Singapore)
+        # …add more regions and their factors here…
+    }
+
+    def __init__(self, power_watts: float = 200.0,         # default: 200 W (e.g., a single GPU)
+                       ef_override: float = None):
+        """
+        Args:
+          power_watts:  average power draw of your VM in watts (e.g., 50 for CPU, 200+ for GPU).
+          ef_override:  if you want to override the region lookup with a custom kg CO₂/kWh.
+                        Otherwise, the class will look up based on the run’s region.
+        """
+        self.power_kw = power_watts / 1000.0  # convert W → kW
+        self._t0 = None
+        self._elapsed_hours = 0.0
+        self.ef_override = ef_override
+        self._emissions_kg = None
+
+        # Grab the current Azure ML Run context
+        self.run: Run = Run.get_context()
+
+    def start(self):
+        """Begin timing."""
+        self._t0 = time.time()
+
+    def stop(self):
+        """
+        Stop timing, compute total elapsed hours, and estimate kg CO₂ emissions.
+        Returns:
+          emissions_kg (float)
+        """
+        if self._t0 is None:
+            raise RuntimeError("Tracker was never started. Call .start() before stopping.")
+
+        elapsed_secs = time.time() - self._t0
+        self._elapsed_hours = elapsed_secs / 3600.0  # convert seconds → hours
+
+        # Determine emission factor (kg CO₂ per kWh) from region if not overridden
+        run_details = self.run.get_details()
+        ws: Workspace = self.run.experiment.workspace
+        compute_name = run_details["target"]  # e.g. "cpu-cluster" or "gpu-cluster"
+
+        # Attempt to get the compute region
+        try:
+            compute_target = ComputeTarget(workspace=ws, name=compute_name)
+            region = compute_target.location.lower()  # e.g. "eastus"
+        except Exception:
+            # Fallback if we can’t find compute target object:
+            region = run_details.get("properties", {}).get("azureRegion", "").lower()
+
+        if self.ef_override is not None:
+            ef = self.ef_override
+        else:
+            ef = CarbonFootprintTracker.REGION_EMISSION_FACTORS.get(region, None)
+            if ef is None:
+                # If region not in mapping, log a warning and default to a safe global average
+                ef = 0.5
+
+        # kWh = power (kW) × time (h)
+        kwh = self.power_kw * self._elapsed_hours
+        # kg CO₂ = kWh × emission factor
+        self._emissions_kg = kwh * ef
+
+        # Log metrics to Azure ML
+        self.run.log("elapsed_hours", float(self._elapsed_hours))
+        self.run.log("energy_kwh", float(kwh))
+        self.run.log("emissions_kg", float(self._emissions_kg))
+        self.run.log("region", region)
+        self.run.log("emission_factor", float(ef))
+        self.run.log("power_kw", float(self.power_kw))
+
+        return self._emissions_kg
+
+    @property
+    def emissions_kg(self):
+        return self._emissions_kg
